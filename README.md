@@ -53,6 +53,12 @@ protocol yourself.
 bun test
 ```
 
+## When it breaks
+
+It will — see [REPAIR.md](REPAIR.md), the playbook for diagnosing what
+hotaudio changed and re-capturing the signature logic, environment hashes,
+and test vector.
+
 ## Layout
 
 - `src/signer.ts`, `src/env_hashes.ts`, `src/nozzle_raw.ts` — the request
