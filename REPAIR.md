@@ -17,6 +17,21 @@ Rule of thumb: 401 means the signer is lying badly. Garbage audio means the
 container format moved. Both at once means they shipped a big player update
 and you're in for the full re-capture.
 
+### First: make sure it's actually broken, not just stale
+
+Not every `401` means the code broke. Listen sessions expire — the `tick`
+from the page state only lives ~15–60 minutes — and an expired tick also
+comes back as an error. The response bodies differ: `bad signature` means
+your signature is wrong (the code broke); anything about expiry means you
+just need a fresh page state. So re-fetch the track page once and retry
+before touching any code. The CLI already fetches fresh state every run, so
+a 401 from the CLI is real breakage — but if you're debugging the library
+with a saved state blob from an hour ago, that's on you.
+
+And whatever you do: don't retry-loop signature failures. One retry with
+fresh state is diagnostics; hammering a bad signature just gets you
+rate-limited.
+
 ## Step 1: check whether their player version moved
 
 The track page loads the player as `/nozzle.js?v=<VERSION>`, and
@@ -66,10 +81,17 @@ exposes it as `globalThis.__lastDt` so we can call it. To rebuild:
 
 Those 144 numbers are a snapshot of the environment checks the player runs
 while signing. The patched bundle uses them directly; the *unpatched* player
-builds the same map by inspecting its own environment. To re-capture, run
-the fresh unpatched bundle in a real desktop Chrome (it will enumerate its
-environment by itself), dump the keys of the map it builds, and write them
-into `src/env_hashes.ts`. All 144 must match — last time, a single wrong
+builds the same map by inspecting its own environment. To re-capture, load
+the real track page in desktop Chrome with the fresh unpatched bundle
+instrumented — hook the global-enumeration opcode's final assignment loop
+with a logger, collect every value it writes, dedupe, and that's your new
+set. Write them into `src/env_hashes.ts`.
+
+One mercy: the hash set comes from *Chrome's* global surface, not from the
+player file, so it usually survives player updates unchanged. The things
+that are file-specific and **must** be re-captured on every new bundle are
+the stack-column constants (`:2:3472`, `:1:37987`) and the `Dt=E(` patch
+point from step 3. All 144 must match — last time, a single wrong
 batch produced signatures that looked right but were rejected.
 
 ## Step 5: pin the new ground truth in the tests
@@ -88,6 +110,45 @@ the new value safely:
 Never update the expected vector just to make the test pass. The test exists
 to catch exactly this kind of drift; changing the expectation without a live
 `200` is hiding the problem.
+
+Useful debugging fact: signing is deterministic for a given
+`(payload, timestamp)` — the timestamp bytes are taken at call time, so two
+calls in the same second agree. If two runs with the same frozen timestamp
+disagree, something in the sandbox changed, not the server.
+
+## Detours that look tempting but aren't
+
+Lessons from the original reverse-engineering, kept here so nobody
+re-learns them the hard way:
+
+- **Don't "clean up" the `(0, eval)(NOZZLE_RAW)` into an import.** Bun's ESM
+  pipeline transpiles imports (rewriting helpers, private fields, etc.),
+  which changes what `Function.prototype.toString` returns — and their code
+  checks exactly that. The raw bytes must be evaluated as-is.
+- **Don't remove the global mutation.** Overwriting
+  `Function.prototype.toString` and tagging `globalThis` look like sins
+  against good hygiene, and they are — but they're load-bearing. The
+  signature reads them.
+- **Run the same patched file everywhere.** Patching shifts column offsets
+  in any stack trace the code captures, so the fabricator constants are only
+  valid for the exact patched bytes they were captured from. Browser
+  experiments and this repo must use the identical file.
+- **Only decrypt listen responses on HTTP 200.** Error bodies (`bad
+  signature`, expiry notices) are plaintext — feeding them to the decryptor
+  just produces a confusing second error.
+- **Don't reach for `node:crypto` for ChaCha20-Poly1305.** Bun's build
+  doesn't implement that cipher (`ERR_CRYPTO_UNKNOWN_CIPHER`). That's why
+  this repo uses `@noble/ciphers`.
+
+## Known limitation: very long tracks
+
+The listen response's `keys` map usually has one entry (`"64"`), which
+covers segments 0–4095. Longer tracks need follow-up listen calls with
+`first:<segmentIndex>` to fetch the next tree-branch keys (the same tick is
+reusable). The downloader doesn't do that yet — a track past ~4096 segments
+dies with `Key missing in keys map`. If you hit it, that's the missing
+feature, not a site update: loop the handshake with `first` set to the
+failing segment index, merge the new keys in, and continue.
 
 ## Step 6: verify end to end
 
