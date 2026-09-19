@@ -1,0 +1,23 @@
+{
+  "name": "hotaudio-downloader",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Hotaudio track downloader and decryption library (Dt signer, HAX0 container)",
+  "bin": {
+    "hotaudio": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "download": "bun src/cli.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^2.3.0",
+    "@noble/curves": "^2.3.0"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "typescript": "~5.9.2"
+  }
+}
