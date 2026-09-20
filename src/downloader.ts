@@ -52,10 +52,18 @@ export async function downloadHotaudioTrack(pageUrl: string): Promise<HotaudioDo
 
     const track = state.tracks[tid];
 
-    // One encrypted listen handshake. Each call needs a fresh signature +
-    // key exchange; the tick is reusable across calls. Follow-up calls pass
-    // first:<segmentIndex> and return extra tree-branch keys (usually without
-    // a url); the initial call uses first:-1 and returns the .hax url.
+    // One session keypair for the whole download. The server derives the
+    // session secret from our X-Key header per request and is stateless, so
+    // reusing our keypair across handshakes is accepted (verified live) and
+    // skips ~15ms of X25519 keygen per follow-up call. The request nonce
+    // still comes from hashing each fresh signature, so no nonce ever
+    // repeats under the reused secret.
+    const session = await performKeyExchange(state.key);
+
+    // One encrypted listen handshake. Each call needs a fresh signature; the
+    // tick and session keypair are reusable across calls. Follow-up calls
+    // pass first:<segmentIndex> and return extra tree-branch keys (usually
+    // without a url); the initial call uses first:-1 and returns the .hax url.
     async function doListen(first: number): Promise<HotaudioListenResponse> {
       const payloadObj = { tid, pid: state.pid, key: track.key, tick: state.tick, first };
       const payloadStr = JSON.stringify(payloadObj);
@@ -64,10 +72,10 @@ export async function downloadHotaudioTrack(pageUrl: string): Promise<HotaudioDo
       // browser earns its keep)
       const sig = signHotaudioPayload(payloadStr);
 
-      // Agree on a secret with their server, then lock the request with it.
-      // The nonce comes from hashing our own signature, which is a little
-      // cute: the encryption is bound to the exact request we signed.
-      const { clientPubHex, Ee } = await performKeyExchange(state.key);
+      // Lock the request with the session secret. The nonce comes from
+      // hashing our own signature, which is a little cute: the encryption
+      // is bound to the exact request we signed.
+      const { clientPubHex, Ee } = session;
       const sigBytes = new TextEncoder().encode(sig);
       const sigHash = await sha256(sigBytes);
       const reqNonce = sigHash.subarray(0, 12);
