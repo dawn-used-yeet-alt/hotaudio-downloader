@@ -4,8 +4,10 @@ import { signHotaudioPayload } from './signer';
 import { parseHax0Header, deriveSegmentKey, decryptSegmentSlice } from './hax_decoder';
 import type { HotaudioListenResponse } from './types';
 
-const DESKTOP_UA =
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const DESKTOP_UA = 'Mozilla/5.0';
+// NOTE: do NOT "upgrade" this to a Chrome UA. Cloudflare currently serves a
+// `cf-mitigated: challenge` (403) to Chrome UAs on both the track page and
+// /api/v1/audio/listen, while the bare `Mozilla/5.0` UA gets HTTP 200.
 
 export interface HotaudioDownload {
   /** Decrypted fragmented-MP4 audio bytes. */
@@ -39,64 +41,82 @@ export async function downloadHotaudioTrack(pageUrl: string): Promise<HotaudioDo
     if (!stateMatch?.[1]) return null;
 
     const state = decryptHotaudioState(stateMatch[1]);
-    const tid = Object.keys(state.tracks)[0];
+    // Prefer the page's own ordering: integer-like track ids sort numerically
+    // under Object.keys(), so the first key is NOT necessarily the main
+    // track (e.g. order [118346, 14574] yields keys ["14574", "118346"]).
+    const orderedIds = Array.isArray((state as any).order)
+      ? (state as any).order.map((n: number) => String(n)).filter((id: string) => state.tracks[id])
+      : [];
+    const tid = orderedIds[0] ?? Object.keys(state.tracks)[0];
     if (!tid || !state.tracks[tid]) return null;
 
     const track = state.tracks[tid];
-    const payloadObj = {
-      tid,
-      pid: state.pid,
-      key: track.key,
-      tick: state.tick,
-      first: -1,
-    };
-    const payloadStr = JSON.stringify(payloadObj);
 
-    // 2. Forge the signature (see signer.ts — here's where the fake
-    // browser earns its keep)
-    const sig = signHotaudioPayload(payloadStr);
+    // One encrypted listen handshake. Each call needs a fresh signature +
+    // key exchange; the tick is reusable across calls. Follow-up calls pass
+    // first:<segmentIndex> and return extra tree-branch keys (usually without
+    // a url); the initial call uses first:-1 and returns the .hax url.
+    async function doListen(first: number): Promise<HotaudioListenResponse> {
+      const payloadObj = { tid, pid: state.pid, key: track.key, tick: state.tick, first };
+      const payloadStr = JSON.stringify(payloadObj);
 
-    // 3. Agree on a secret with their server, then lock the request with it.
-    // The nonce comes from hashing our own signature, which is a little
-    // cute: the encryption is bound to the exact request we signed.
-    const { clientPubHex, Ee } = await performKeyExchange(state.key);
-    const sigBytes = new TextEncoder().encode(sig);
-    const sigHash = await sha256(sigBytes);
-    const reqNonce = sigHash.subarray(0, 12);
+      // Forge the signature (see signer.ts — here's where the fake
+      // browser earns its keep)
+      const sig = signHotaudioPayload(payloadStr);
 
-    const payloadBytes = new TextEncoder().encode(payloadStr);
-    const cipher = chacha20poly1305(Ee, reqNonce);
-    const encBody = cipher.encrypt(payloadBytes);
+      // Agree on a secret with their server, then lock the request with it.
+      // The nonce comes from hashing our own signature, which is a little
+      // cute: the encryption is bound to the exact request we signed.
+      const { clientPubHex, Ee } = await performKeyExchange(state.key);
+      const sigBytes = new TextEncoder().encode(sig);
+      const sigHash = await sha256(sigBytes);
+      const reqNonce = sigHash.subarray(0, 12);
 
-    // 4. POST /api/v1/audio/listen
-    const listenRes = await fetch('https://hotaudio.net/api/v1/audio/listen', {
-      method: 'POST',
-      headers: {
-        'X-Signature': sig,
-        'X-Key': clientPubHex,
-        'Content-Type': 'application/vnd.hotaudio.crypt+json',
-        'User-Agent': DESKTOP_UA,
-        Origin: 'https://hotaudio.net',
-        Referer: 'https://hotaudio.net/',
-      },
-      body: encBody,
-    });
+      const payloadBytes = new TextEncoder().encode(payloadStr);
+      const cipher = chacha20poly1305(Ee, reqNonce);
+      const encBody = cipher.encrypt(payloadBytes);
 
-    if (!listenRes.ok) {
-      console.error(`Hotaudio listen API returned ${listenRes.status}`);
-      return null;
+      // POST /api/v1/audio/listen
+      const listenRes = await fetch('https://hotaudio.net/api/v1/audio/listen', {
+        method: 'POST',
+        headers: {
+          'X-Signature': sig,
+          'X-Key': clientPubHex,
+          'Content-Type': 'application/vnd.hotaudio.crypt+json',
+          'User-Agent': DESKTOP_UA,
+          Origin: 'https://hotaudio.net',
+          Referer: 'https://hotaudio.net/',
+        },
+        body: encBody,
+      });
+
+      if (!listenRes.ok) {
+        throw new Error(`Hotaudio listen API returned ${listenRes.status} for first=${first}`);
+      }
+
+      // Unwrap their reply. They encrypt it with the same secret but
+      // tick the first nonce byte up by one — presumably so a captured
+      // request can't be replayed back at us as a fake response.
+      const respBuf = new Uint8Array(await listenRes.arrayBuffer());
+      const respNonce = new Uint8Array(reqNonce);
+      respNonce[0] = (respNonce[0] + 1) & 0xff;
+
+      const decCipher = chacha20poly1305(Ee, respNonce);
+      const decRespBytes = decCipher.decrypt(respBuf);
+      return JSON.parse(new TextDecoder().decode(decRespBytes)) as HotaudioListenResponse;
     }
 
-    // 5. Unwrap their reply. They encrypt it with the same secret but
-    // tick the first nonce byte up by one — presumably so a captured
-    // request can't be replayed back at us as a fake response.
-    const respBuf = new Uint8Array(await listenRes.arrayBuffer());
-    const respNonce = new Uint8Array(reqNonce);
-    respNonce[0] = (respNonce[0] + 1) & 0xff;
-
-    const decCipher = chacha20poly1305(Ee, respNonce);
-    const decRespBytes = decCipher.decrypt(respBuf);
-    const listenData = JSON.parse(new TextDecoder().decode(decRespBytes)) as HotaudioListenResponse;
+    let listenData: HotaudioListenResponse;
+    try {
+      listenData = await doListen(-1);
+    } catch (err) {
+      console.error(err instanceof Error ? err.message : err);
+      return null;
+    }
+    if (!listenData.url) {
+      console.error('Hotaudio listen API returned no .hax url');
+      return null;
+    }
 
     // 6. Download .hax file
     const haxRes = await fetch(listenData.url, { headers: { 'User-Agent': DESKTOP_UA } });
@@ -119,7 +139,27 @@ export async function downloadHotaudioTrack(pageUrl: string): Promise<HotaudioDo
       const seg = hax.segments[i];
       const nextOff = i + 1 < hax.segmentCount ? hax.segments[i + 1].offset : hax.fileLength;
       const slice = haxBytes.subarray(seg.offset, nextOff);
-      const segKey = await deriveSegmentKey(keysMap, hax.segmentCount, i);
+      let segKey: Uint8Array;
+      try {
+        segKey = await deriveSegmentKey(keysMap, hax.segmentCount, i);
+      } catch (err) {
+        if (!(err instanceof Error) || !err.message.startsWith('Key missing in keys map')) throw err;
+        // The initial handshake only hands out the first tree-branch key(s).
+        // Longer tracks need follow-up handshakes with first:<segmentIndex>
+        // to fetch the branch covering segment i (same tick is reusable).
+        // Merge the new keys in and retry — each fetch covers a contiguous
+        // block, so this runs ~segmentCount/blockSize times, not per segment.
+        console.error(`Fetching keys for segment ${i} (have ${Object.keys(keysMap).length} branches) ...`);
+        const extra = await doListen(i);
+        let merged = 0;
+        for (const [k, v] of Object.entries(extra.keys)) {
+          const n = parseInt(k, 10);
+          if (!keysMap[n]) merged++;
+          keysMap[n] = hexToBytes(v);
+        }
+        if (merged === 0) throw err;
+        segKey = await deriveSegmentKey(keysMap, hax.segmentCount, i);
+      }
       const plain = decryptSegmentSlice(slice, segKey);
       decryptedSlices.push(plain);
       totalLength += plain.length;

@@ -140,16 +140,6 @@ re-learns them the hard way:
   doesn't implement that cipher (`ERR_CRYPTO_UNKNOWN_CIPHER`). That's why
   this repo uses `@noble/ciphers`.
 
-## Known limitation: very long tracks
-
-The listen response's `keys` map usually has one entry (`"64"`), which
-covers segments 0–4095. Longer tracks need follow-up listen calls with
-`first:<segmentIndex>` to fetch the next tree-branch keys (the same tick is
-reusable). The downloader doesn't do that yet — a track past ~4096 segments
-dies with `Key missing in keys map`. If you hit it, that's the missing
-feature, not a site update: loop the handshake with `first` set to the
-failing segment index, merge the new keys in, and continue.
-
 ## Step 6: verify end to end
 
 ```sh

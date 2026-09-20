@@ -10,6 +10,7 @@ export interface HotaudioState {
   pid: string;
   tick: string;
   key: string; // their X25519 public key, hex-encoded
+  order?: number[];
   tracks: Record<string, HotaudioTrack>;
 }
 
