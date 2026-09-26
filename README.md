@@ -55,7 +55,8 @@ bun test
 
 ## When it breaks
 
-It will — see [REPAIR.md](REPAIR.md), the playbook for diagnosing what
+It will — run `bun scripts/diagnose.ts <track-url>` for triage, then see
+[REPAIR.md](REPAIR.md), the playbook for diagnosing what
 hotaudio changed and re-capturing the signature logic, environment hashes,
 and test vector.
 

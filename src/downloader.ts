@@ -9,6 +9,11 @@ const DESKTOP_UA = 'Mozilla/5.0';
 // `cf-mitigated: challenge` (403) to Chrome UAs on both the track page and
 // /api/v1/audio/listen, while the bare `Mozilla/5.0` UA gets HTTP 200.
 
+// Shared codecs: constructing these per request is pure overhead (~300+
+// constructions per download for zero benefit).
+const UTF8_ENC = new TextEncoder();
+const UTF8_DEC = new TextDecoder();
+
 export interface HotaudioDownload {
   /** Decrypted fragmented-MP4 audio bytes. */
   data: Uint8Array;
@@ -44,8 +49,8 @@ export async function downloadHotaudioTrack(pageUrl: string): Promise<HotaudioDo
     // Prefer the page's own ordering: integer-like track ids sort numerically
     // under Object.keys(), so the first key is NOT necessarily the main
     // track (e.g. order [118346, 14574] yields keys ["14574", "118346"]).
-    const orderedIds = Array.isArray((state as any).order)
-      ? (state as any).order.map((n: number) => String(n)).filter((id: string) => state.tracks[id])
+    const orderedIds = Array.isArray(state.order)
+      ? state.order.map((n: number) => String(n)).filter((id: string) => state.tracks[id])
       : [];
     const tid = orderedIds[0] ?? Object.keys(state.tracks)[0];
     if (!tid || !state.tracks[tid]) return null;
@@ -76,11 +81,11 @@ export async function downloadHotaudioTrack(pageUrl: string): Promise<HotaudioDo
       // hashing our own signature, which is a little cute: the encryption
       // is bound to the exact request we signed.
       const { clientPubHex, Ee } = session;
-      const sigBytes = new TextEncoder().encode(sig);
+      const sigBytes = UTF8_ENC.encode(sig);
       const sigHash = await sha256(sigBytes);
       const reqNonce = sigHash.subarray(0, 12);
 
-      const payloadBytes = new TextEncoder().encode(payloadStr);
+      const payloadBytes = UTF8_ENC.encode(payloadStr);
       const cipher = chacha20poly1305(Ee, reqNonce);
       const encBody = cipher.encrypt(payloadBytes);
 
@@ -111,7 +116,7 @@ export async function downloadHotaudioTrack(pageUrl: string): Promise<HotaudioDo
 
       const decCipher = chacha20poly1305(Ee, respNonce);
       const decRespBytes = decCipher.decrypt(respBuf);
-      return JSON.parse(new TextDecoder().decode(decRespBytes)) as HotaudioListenResponse;
+      return JSON.parse(UTF8_DEC.decode(decRespBytes)) as HotaudioListenResponse;
     }
 
     let listenData: HotaudioListenResponse;
@@ -143,13 +148,18 @@ export async function downloadHotaudioTrack(pageUrl: string): Promise<HotaudioDo
     const decryptedSlices: Uint8Array[] = [];
     let totalLength = 0;
 
+    // Memoize intermediate tree-node keys across segments (see
+    // deriveSegmentKey). Must be cleared whenever new branch keys merge,
+    // so cached nodes never outlive the ground truth they derived from.
+    const nodeKeyCache = new Map<number, Uint8Array>();
+
     for (let i = 0; i < hax.segmentCount; i++) {
       const seg = hax.segments[i];
       const nextOff = i + 1 < hax.segmentCount ? hax.segments[i + 1].offset : hax.fileLength;
       const slice = haxBytes.subarray(seg.offset, nextOff);
       let segKey: Uint8Array;
       try {
-        segKey = await deriveSegmentKey(keysMap, hax.segmentCount, i);
+        segKey = await deriveSegmentKey(keysMap, hax.segmentCount, i, nodeKeyCache);
       } catch (err) {
         if (!(err instanceof Error) || !err.message.startsWith('Key missing in keys map')) throw err;
         // The initial handshake only hands out the first tree-branch key(s).
@@ -166,7 +176,8 @@ export async function downloadHotaudioTrack(pageUrl: string): Promise<HotaudioDo
           keysMap[n] = hexToBytes(v);
         }
         if (merged === 0) throw err;
-        segKey = await deriveSegmentKey(keysMap, hax.segmentCount, i);
+        nodeKeyCache.clear();
+        segKey = await deriveSegmentKey(keysMap, hax.segmentCount, i, nodeKeyCache);
       }
       const plain = decryptSegmentSlice(slice, segKey);
       decryptedSlices.push(plain);

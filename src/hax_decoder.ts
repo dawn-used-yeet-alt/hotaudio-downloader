@@ -8,6 +8,8 @@ import { chacha20poly1305 } from '@noble/ciphers/chacha.js';
 import { sha256 } from './crypto';
 import type { Hax0Container, Hax0Segment } from './types';
 
+const UTF8_DEC = new TextDecoder();
+
 /**
  * A tiny bencode reader — just integers, byte strings, and dicts, which is
  * all the container metadata uses. Nothing fancy, and that's the point.
@@ -19,7 +21,7 @@ export function decodeBencode(buf: Uint8Array, offset: number): { value: any; ne
   if (byte === 0x69) {
     let end = offset + 1;
     while (buf[end] !== 0x65 && end < buf.length) end++;
-    const str = new TextDecoder().decode(buf.subarray(offset + 1, end));
+    const str = UTF8_DEC.decode(buf.subarray(offset + 1, end));
     return { value: parseInt(str, 10), nextOffset: end + 1 };
   }
 
@@ -29,7 +31,7 @@ export function decodeBencode(buf: Uint8Array, offset: number): { value: any; ne
     const dict: Record<string, any> = {};
     while (buf[curr] !== 0x65 && curr < buf.length) {
       const keyDec = decodeBencode(buf, curr);
-      const keyStr = new TextDecoder().decode(keyDec.value);
+      const keyStr = UTF8_DEC.decode(keyDec.value);
       curr = keyDec.nextOffset;
       const valDec = decodeBencode(buf, curr);
       dict[keyStr] = valDec.value;
@@ -42,7 +44,7 @@ export function decodeBencode(buf: Uint8Array, offset: number): { value: any; ne
   let colon = offset;
   while (colon < buf.length && buf[colon] >= 0x30 && buf[colon] <= 0x39) colon++;
   if (buf[colon] === 0x3a) {
-    const lenStr = new TextDecoder().decode(buf.subarray(offset, colon));
+    const lenStr = UTF8_DEC.decode(buf.subarray(offset, colon));
     const len = parseInt(lenStr, 10);
     const start = colon + 1;
     const data = buf.subarray(start, start + len);
@@ -60,7 +62,7 @@ export function decodeBencode(buf: Uint8Array, offset: number): { value: any; ne
  */
 export function parseHax0Header(buffer: Uint8Array): Hax0Container {
   const view = new DataView(buffer.buffer, buffer.byteOffset, buffer.byteLength);
-  const magic = new TextDecoder().decode(buffer.subarray(0, 4));
+  const magic = UTF8_DEC.decode(buffer.subarray(0, 4));
   if (magic !== 'HAX0') throw new Error(`Invalid HAX0 magic: ${magic}`);
 
   const fileLength = view.getUint32(4, true);
@@ -70,7 +72,7 @@ export function parseHax0Header(buffer: Uint8Array): Hax0Container {
   const metaDec = decodeBencode(buffer.subarray(16, headerLength), 0);
   const meta = metaDec.value;
 
-  const codec = typeof meta.codec === 'string' ? meta.codec : new TextDecoder().decode(meta.codec);
+  const codec = typeof meta.codec === 'string' ? meta.codec : UTF8_DEC.decode(meta.codec);
   const durationMs = meta.durationMs;
   const segmentCount = meta.segmentCount;
   const rawSegments: Uint8Array = meta.segments;
@@ -100,11 +102,18 @@ export function parseHax0Header(buffer: Uint8Array): Hax0Container {
  * a few keys high up in a binary tree, so we find the nearest ancestor we
  * have and hash our way down to the segment, one byte per level. Sounds
  * exotic, but it's just SHA-256 in a loop.
+ *
+ * Pass a `cache` map (one per download) to memoize intermediate tree-node
+ * keys: consecutive segments share most of their ancestor path, so this
+ * skips roughly two thirds of the hashes across a full track. The caller
+ * must clear it whenever new branch keys merge into `keysMap`, so a node
+ * is never reused across different ground truth.
  */
 export async function deriveSegmentKey(
   keysMap: Record<number, Uint8Array>,
   segmentCount: number,
-  segIdx: number
+  segIdx: number,
+  cache?: Map<number, Uint8Array>
 ): Promise<Uint8Array> {
   const bitLen = (segmentCount - 1).toString(2).length;
   const treeBase = 1 + (1 << (bitLen + 1));
@@ -128,11 +137,18 @@ export async function deriveSegmentKey(
   }
 
   for (let a = startLevel + 1; a <= t; a++) {
+    const nodeIdx = e >> (t - a);
+    const hit = cache?.get(nodeIdx);
+    if (hit) {
+      currKey = hit;
+      continue;
+    }
     const branchByte = new Uint8Array([(e >> (t - a)) & 0xff]);
     const merged = new Uint8Array(currKey.length + 1);
     merged.set(currKey, 0);
     merged.set(branchByte, currKey.length);
     currKey = await sha256(merged);
+    cache?.set(nodeIdx, currKey);
   }
 
   return currKey;

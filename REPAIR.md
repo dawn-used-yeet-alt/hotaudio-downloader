@@ -4,6 +4,22 @@ Hotaudio changes their player code regularly. When they do, downloads fail
 and the fix is always some variant of: look at what changed on their side,
 re-capture it, pin it in the tests. This file is the playbook.
 
+## Quick scripts
+
+Each step below has a script (all take a track page URL). Start with triage:
+
+```sh
+bun scripts/diagnose.ts https://hotaudio.net/u/SomeUser/Some-Title
+bun scripts/check-version.ts https://hotaudio.net/u/SomeUser/Some-Title
+bun scripts/update-nozzle.ts https://hotaudio.net/u/SomeUser/Some-Title
+# ... verify a live 200 download, then only:
+bun scripts/update-vector.ts --live-ok
+```
+
+`update-nozzle.ts` does the mechanical part of steps 2–3 (download, patch,
+rewrite, smoke test). The stack columns, env hashes, and test vector still
+need the manual verification described below — the scripts refuse to skip it.
+
 ## What failure looks like
 
 | Symptom | Most likely cause | Where to fix |

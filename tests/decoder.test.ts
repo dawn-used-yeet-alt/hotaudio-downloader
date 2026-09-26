@@ -29,4 +29,17 @@ describe('HAX0 decoder', () => {
     expect(key127.length).toBe(32);
     expect(key127).not.toEqual(key0);
   });
+
+  it('derives identical keys with and without the node-key cache', async () => {
+    const rootKeyHex = '5b3201fe002e7ce21ed801e5bd74510253243ce9ef22d6914e6ac3ca475b2f47';
+    const rootKeyBytes = new Uint8Array(Buffer.from(rootKeyHex, 'hex'));
+    const keysMap: Record<number, Uint8Array> = { 16: rootKeyBytes };
+    const cache = new Map<number, Uint8Array>();
+    for (let i = 0; i < 127; i++) {
+      const plain = await deriveSegmentKey(keysMap, 899, i);
+      const cached = await deriveSegmentKey(keysMap, 899, i, cache);
+      expect(Buffer.from(cached).toString('hex')).toBe(Buffer.from(plain).toString('hex'));
+    }
+    expect(cache.size).toBeGreaterThan(0);
+  });
 });

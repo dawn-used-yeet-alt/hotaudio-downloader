@@ -10,7 +10,11 @@
   "scripts": {
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "download": "bun src/cli.ts"
+    "download": "bun src/cli.ts",
+    "diagnose": "bun scripts/diagnose.ts",
+    "check-version": "bun scripts/check-version.ts",
+    "update-nozzle": "bun scripts/update-nozzle.ts",
+    "update-vector": "bun scripts/update-vector.ts"
   },
   "dependencies": {
     "@noble/ciphers": "^2.3.0",
