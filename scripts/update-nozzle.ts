@@ -5,8 +5,8 @@
 //   bun scripts/update-nozzle.ts <track-page-url> --version ABC123
 //   bun scripts/update-nozzle.ts <track-page-url> --bundle /tmp/player.js --version ABC123
 //
-// One thing this cannot do: a few numbers in src/signer.ts and
-// src/env_hashes.ts have to be checked by hand afterwards.
+// One thing this cannot do: a few numbers in src/signer/version.ts and
+// src/signer/env_hashes.ts have to be checked by hand afterwards.
 // This script prints those steps at the end (they are in REPAIR.md too).
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -95,29 +95,32 @@ if (matches.length !== 1) {
 }
 const edited = playerCode.replace(/(?<![\w$.])Dt\s*=\s*E\(/, 'globalThis.__lastDt=Dt=E(');
 
-// Save the edited player into src/nozzle_raw.ts.
-const nozzlePath = path.join(REPO_ROOT, 'src/nozzle_raw.ts');
+// Save the edited player into src/signer/nozzle_raw.ts.
+const nozzlePath = path.join(REPO_ROOT, 'src/signer/nozzle_raw.ts');
 const header =
   '// Player version ' + version + ', with one small edit (see REPAIR.md step 3).\n' +
   '// The site writes Dt=E(...); we write globalThis.__lastDt=Dt=E(...) so our code can call it.\n';
 fs.writeFileSync(nozzlePath, header + 'export const NOZZLE_RAW = ' + JSON.stringify(edited) + ';\n');
 console.log('Saved ' + path.relative(REPO_ROOT, nozzlePath) + ' (' + edited.length + ' characters).');
 
-// Point src/signer.ts at the new version.
-const signerPath = path.join(REPO_ROOT, 'src/signer.ts');
-const signerText = fs.readFileSync(signerPath, 'utf8');
-if (!/nozzle\.js\?v=[A-Za-z0-9]+/.test(signerText)) {
-  console.error('Could not find the player address in src/signer.ts. Update it by hand.');
+// Point src/signer/version.ts at the new version (single source of truth).
+const versionPath = path.join(REPO_ROOT, 'src/signer/version.ts');
+const versionText = fs.readFileSync(versionPath, 'utf8');
+if (!/PINNED_NOZZLE_VERSION\s*=\s*['"][A-Za-z0-9]+['"]/.test(versionText)) {
+  console.error('Could not find PINNED_NOZZLE_VERSION in src/signer/version.ts. Update it by hand.');
   process.exit(1);
 }
 fs.writeFileSync(
-  signerPath,
-  signerText.replace(/nozzle\.js\?v=[A-Za-z0-9]+/, 'nozzle.js?v=' + version)
+  versionPath,
+  versionText.replace(
+    /PINNED_NOZZLE_VERSION\s*=\s*['"][A-Za-z0-9]+['"]/,
+    `PINNED_NOZZLE_VERSION = '${version}'`,
+  ),
 );
-console.log('Updated the player address in src/signer.ts to version ' + version + '.');
+console.log('Updated PINNED_NOZZLE_VERSION in src/signer/version.ts to version ' + version + '.');
 
 // Try the new copy once, so a typo shows up now and not later.
-const { signHotaudioPayload } = await import('../src/signer.ts');
+const { signHotaudioPayload } = await import('../src/signer/signer.ts');
 try {
   const sample = JSON.stringify({ tid: '123', pid: '456', key: 'test', tick: 'abc', first: -1 });
   const sig = signHotaudioPayload(sample);
@@ -133,9 +136,9 @@ try {
 
 console.log('');
 console.log('Still to do by hand (see REPAIR.md):');
-console.log('  1. Check the two stack numbers in src/signer.ts (":2:3472" and ":1:37987").');
+console.log('  1. Check the two stack numbers in src/signer/version.ts (FAB_STACK_COLUMN / FAB_STACK_INNER).');
 console.log('     They belong to this exact player copy, so they may need updating.');
-console.log('  2. If downloads still fail, re-capture src/env_hashes.ts.');
+console.log('  2. If downloads still fail, re-capture src/signer/env_hashes.ts.');
 console.log('  3. Prove a real download works: bun src/cli.ts ' + trackUrl + ' -o /tmp/check.m4a');
 console.log('  4. Only then: bun scripts/update-vector.ts --live-ok');
 console.log('  5. Run bun test (all green) and commit everything together.');

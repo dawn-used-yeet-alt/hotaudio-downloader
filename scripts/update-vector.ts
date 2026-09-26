@@ -9,7 +9,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { isTrackUrl, REPO_ROOT } from './common';
-import { signHotaudioPayload } from '../src/signer';
+import { signHotaudioPayload } from '../src/signer/signer';
 import { downloadHotaudioTrack } from '../src/downloader';
 
 // The test always signs this same request, so the answer should always match.

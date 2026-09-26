@@ -27,7 +27,7 @@ try {
 
 const live = extractNozzleVersion(page);
 
-console.log('Version in our code: ' + (saved || '(not found in src/signer.ts)'));
+console.log('Version in our code: ' + (saved || '(not found in src/signer/version.ts)'));
 console.log('Version on the site: ' + (live || '(not found on the page)'));
 
 if (!live) {
@@ -35,7 +35,7 @@ if (!live) {
   process.exit(2);
 }
 if (!saved) {
-  console.error('Could not find the saved version in src/signer.ts.');
+  console.error('Could not find the saved version in src/signer/version.ts.');
   process.exit(2);
 }
 if (live === saved) {

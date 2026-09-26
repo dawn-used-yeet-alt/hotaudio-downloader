@@ -24,9 +24,9 @@ need the manual verification described below — the scripts refuse to skip it.
 
 | Symptom | Most likely cause | Where to fix |
 |---|---|---|
-| `Hotaudio listen API returned 401`, body says `bad signature` | Their signature code or environment checks changed; our forgery no longer passes | `src/signer.ts`, `src/nozzle_raw.ts`, `src/env_hashes.ts` |
+| `Hotaudio listen API returned 401`, body says `bad signature` | Their signature code or environment checks changed; our forgery no longer passes | `src/signer/` (`signer.ts`, `sandbox.ts`, `version.ts`, `nozzle_raw.ts`, `env_hashes.ts`) |
 | `NO STATE` / no `__ha_state` on the page, or state won't decrypt | Track page markup or state format changed | `src/crypto.ts`, `src/downloader.ts` |
-| Listen succeeds but audio decrypts to garbage (no `ftyp` box) | `.hax` container or key-derivation changed | `src/hax_decoder.ts` |
+| Listen succeeds but audio decrypts to garbage (no `ftyp` box) | `.hax` container or key-derivation changed | `src/hax/` (`container.ts`, `keys.ts`) |
 | Everything works but the test suite fails on the signature vector | The test pins an exact signature — it *should* fail when signing logic changes (see below) | `tests/signer.test.ts` |
 
 Rule of thumb: 401 means the signer is lying badly. Garbage audio means the
@@ -51,7 +51,7 @@ rate-limited.
 ## Step 1: check whether their player version moved
 
 The track page loads the player as `/nozzle.js?v=<VERSION>`, and
-`src/signer.ts` hardcodes that version in `NOZZLE_URL`. Compare them:
+`src/signer/version.ts` pins that version as `PINNED_NOZZLE_VERSION`. Compare them:
 
 ```sh
 # What the live page loads right now:
@@ -79,21 +79,21 @@ head -c 200 /tmp/live-nozzle.js   # should start with JS, not <!DOCTYPE
 Diff it against the previous bundle to see what actually changed before you
 touch anything.
 
-## Step 3: rebuild `src/nozzle_raw.ts`
+## Step 3: rebuild `src/signer/nozzle_raw.ts`
 
-`src/nozzle_raw.ts` is the live player bundle plus one small patch: where the
+`src/signer/nozzle_raw.ts` is the live player bundle plus one small patch: where the
 original assigns its internal signature function (`Dt=...`), ours also
 exposes it as `globalThis.__lastDt` so we can call it. To rebuild:
 
 1. Find the `Dt=` assignment in the fresh bundle.
 2. Change it to `globalThis.__lastDt=Dt=...` (same statement, just exported).
-3. Embed the result as the `NOZZLE_RAW` string in `src/nozzle_raw.ts`.
-4. Update `NOZZLE_URL` in `src/signer.ts` to the new version, and check the
+3. Embed the result as the `NOZZLE_RAW` string in `src/signer/nozzle_raw.ts`.
+4. Update `PINNED_NOZZLE_VERSION` in `src/signer/version.ts` to the new version (or let `update-nozzle.ts` do it), and check the
    hardcoded stack frames in the error fabricator (`:2:3472` and `:1:37987`)
    still match the new bundle — their code reads its own stack traces, so
    stale line numbers produce wrong signatures.
 
-## Step 4: re-capture `src/env_hashes.ts`
+## Step 4: re-capture `src/signer/env_hashes.ts`
 
 Those 144 numbers are a snapshot of the environment checks the player runs
 while signing. The patched bundle uses them directly; the *unpatched* player
@@ -101,7 +101,7 @@ builds the same map by inspecting its own environment. To re-capture, load
 the real track page in desktop Chrome with the fresh unpatched bundle
 instrumented — hook the global-enumeration opcode's final assignment loop
 with a logger, collect every value it writes, dedupe, and that's your new
-set. Write them into `src/env_hashes.ts`.
+set. Write them into `src/signer/env_hashes.ts`.
 
 One mercy: the hash set comes from *Chrome's* global surface, not from the
 player file, so it usually survives player updates unchanged. The things

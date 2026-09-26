@@ -13,10 +13,11 @@ export const REPO_ROOT = path.resolve(
   '..'
 );
 
-// Which player version is saved in our code?
+// Which player version is saved in our code? Single source of truth is
+// src/signer/version.ts (PINNED_NOZZLE_VERSION).
 export function readPinnedVersion(): string | null {
-  const signer = fs.readFileSync(path.join(REPO_ROOT, 'src/signer.ts'), 'utf8');
-  const found = signer.match(/nozzle\.js\?v=([A-Za-z0-9]+)/);
+  const versionFile = fs.readFileSync(path.join(REPO_ROOT, 'src/signer/version.ts'), 'utf8');
+  const found = versionFile.match(/PINNED_NOZZLE_VERSION\s*=\s*['"]([^'"]+)['"]/);
   if (!found) {
     return null;
   }

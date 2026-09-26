@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { signHotaudioPayload } from '../src/signer';
+import { signHotaudioPayload } from '../src/signer/signer';
 
 describe('signHotaudioPayload', () => {
   it('matches ground-truth signature vector at frozen timestamp t=1787330000', () => {
@@ -19,5 +19,14 @@ describe('signHotaudioPayload', () => {
     const payload = JSON.stringify({ tid: '123', pid: '456', key: 'test', tick: 'abc', first: -1 });
     const sig = signHotaudioPayload(payload);
     expect(sig).toMatch(/^9:[0-9a-f]{32}$/);
+  });
+
+  it('rejects empty payloads instead of signing garbage', () => {
+    expect(() => signHotaudioPayload('')).toThrow();
+  });
+
+  it('is deterministic for the same frozen timestamp', () => {
+    const payload = JSON.stringify({ tid: '1', pid: '2', key: 'k', tick: 't', first: -1 });
+    expect(signHotaudioPayload(payload, 1787330000)).toBe(signHotaudioPayload(payload, 1787330000));
   });
 });

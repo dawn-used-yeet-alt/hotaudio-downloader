@@ -1,21 +1,19 @@
-import { chacha20poly1305 } from '@noble/ciphers/chacha.js';
-import { decryptHotaudioState, performKeyExchange, sha256, hexToBytes } from './crypto';
-import { signHotaudioPayload } from './signer';
-import { parseHax0Header, deriveSegmentKey, decryptSegmentSlice } from './hax_decoder';
-import type { HotaudioListenResponse } from './types';
-
-const DESKTOP_UA = 'Mozilla/5.0';
-// NOTE: do NOT "upgrade" this to a Chrome UA. Cloudflare currently serves a
-// `cf-mitigated: challenge` (403) to Chrome UAs on both the track page and
-// /api/v1/audio/listen, while the bare `Mozilla/5.0` UA gets HTTP 200.
-
-// Shared codecs: constructing these per request is pure overhead (~300+
-// constructions per download for zero benefit).
-const UTF8_ENC = new TextEncoder();
-const UTF8_DEC = new TextDecoder();
+/**
+ * Download orchestrator. Each step is a small method so failures map to one
+ * error code and tests can drive steps in isolation.
+ */
+import { HotaudioError } from './errors';
+import { DEFAULT_CONFIG, resolveConfig, type HotaudioConfig } from './config';
+import { silentLogger, type Logger } from './logger';
+import type { FetchFn } from './http';
+import { fetchBytesWithRetry } from './http';
+import { decryptHotaudioState, hexToBytes, performKeyExchange } from './crypto';
+import { extractStateBlob, fetchTrackPageHtml } from './page';
+import { parseHax0Header } from './hax/container';
+import { KeyRing, decryptSegmentSlice } from './hax/keys';
+import { doListen } from './listen';
 
 export interface HotaudioDownload {
-  /** Decrypted fragmented-MP4 audio bytes. */
   data: Uint8Array;
   mimeType: 'audio/mp4';
   title: string;
@@ -23,177 +21,108 @@ export interface HotaudioDownload {
   durationSeconds: number;
 }
 
-/**
- * Downloads and decrypts a hotaudio track page into raw audio bytes.
- *
- * The whole dance, start to finish: fetch the page, unpack its hidden
- * state, forge the request signature, agree on a secret with their server,
- * ask for the audio file, then decrypt every segment and glue the pieces
- * back together into a playable file.
- *
- * Returns `null` when anything goes sideways (no audio on the page, the
- * server says no, the network flakes). Check the console for the gory
- * details.
- */
-export async function downloadHotaudioTrack(pageUrl: string): Promise<HotaudioDownload | null> {
-  try {
-    // 1. Fetch track page and extract __ha_state
-    const pageRes = await fetch(pageUrl, { headers: { 'User-Agent': DESKTOP_UA } });
-    if (!pageRes.ok) return null;
-    const html = await pageRes.text();
+export interface DownloadOptions {
+  config?: Partial<HotaudioConfig>;
+  fetchFn?: FetchFn;
+  logger?: Logger;
+  /** Preferred track id; defaults to state.order[0]. */
+  trackId?: string;
+  onProgress?: (done: number, total: number) => void;
+}
 
-    const stateMatch = html.match(/var __ha_state = "([^"]+)"/);
-    if (!stateMatch?.[1]) return null;
+function pickTrackId(
+  tracks: Record<string, { key: string; title: string }>,
+  order: number[] | undefined,
+  preferred?: string,
+): string {
+  if (preferred && tracks[preferred]) return preferred;
+  if (preferred) {
+    throw new HotaudioError('state_invalid', `Track ${preferred} not in page state`);
+  }
+  // Integer-like ids sort numerically under Object.keys(), so respect the
+  // page's own ordering instead of taking keys()[0].
+  const ordered = (Array.isArray(order) ? order.map(String) : []).filter((id) => tracks[id]);
+  return ordered[0] ?? Object.keys(tracks)[0];
+}
 
-    const state = decryptHotaudioState(stateMatch[1]);
-    // Prefer the page's own ordering: integer-like track ids sort numerically
-    // under Object.keys(), so the first key is NOT necessarily the main
-    // track (e.g. order [118346, 14574] yields keys ["14574", "118346"]).
-    const orderedIds = Array.isArray(state.order)
-      ? state.order.map((n: number) => String(n)).filter((id: string) => state.tracks[id])
-      : [];
-    const tid = orderedIds[0] ?? Object.keys(state.tracks)[0];
-    if (!tid || !state.tracks[tid]) return null;
+export class HotaudioDownloader {
+  readonly config: HotaudioConfig;
+  readonly fetchFn: FetchFn;
+  readonly logger: Logger;
 
+  constructor(opts: { config?: Partial<HotaudioConfig>; fetchFn?: FetchFn; logger?: Logger } = {}) {
+    this.config = resolveConfig(opts.config);
+    this.fetchFn = opts.fetchFn ?? fetch;
+    this.logger = opts.logger ?? silentLogger();
+  }
+
+  async download(pageUrl: string, opts: Omit<DownloadOptions, 'config' | 'fetchFn' | 'logger'> = {}): Promise<HotaudioDownload> {
+    const html = await fetchTrackPageHtml(pageUrl, this.config, this.fetchFn);
+    const state = decryptHotaudioState(extractStateBlob(html));
+    const tid = pickTrackId(state.tracks, state.order, opts.trackId);
     const track = state.tracks[tid];
+    if (!track) throw new HotaudioError('state_invalid', 'Selected track missing from state');
 
-    // One session keypair for the whole download. The server derives the
-    // session secret from our X-Key header per request and is stateless, so
-    // reusing our keypair across handshakes is accepted (verified live) and
-    // skips ~15ms of X25519 keygen per follow-up call. The request nonce
-    // still comes from hashing each fresh signature, so no nonce ever
-    // repeats under the reused secret.
     const session = await performKeyExchange(state.key);
+    const listen = (first: number) =>
+      doListen({ tid, pid: state.pid, key: track.key, tick: state.tick, first }, session, this.config, this.fetchFn);
 
-    // One encrypted listen handshake. Each call needs a fresh signature; the
-    // tick and session keypair are reusable across calls. Follow-up calls
-    // pass first:<segmentIndex> and return extra tree-branch keys (usually
-    // without a url); the initial call uses first:-1 and returns the .hax url.
-    async function doListen(first: number): Promise<HotaudioListenResponse> {
-      const payloadObj = { tid, pid: state.pid, key: track.key, tick: state.tick, first };
-      const payloadStr = JSON.stringify(payloadObj);
-
-      // Forge the signature (see signer.ts — here's where the fake
-      // browser earns its keep)
-      const sig = signHotaudioPayload(payloadStr);
-
-      // Lock the request with the session secret. The nonce comes from
-      // hashing our own signature, which is a little cute: the encryption
-      // is bound to the exact request we signed.
-      const { clientPubHex, Ee } = session;
-      const sigBytes = UTF8_ENC.encode(sig);
-      const sigHash = await sha256(sigBytes);
-      const reqNonce = sigHash.subarray(0, 12);
-
-      const payloadBytes = UTF8_ENC.encode(payloadStr);
-      const cipher = chacha20poly1305(Ee, reqNonce);
-      const encBody = cipher.encrypt(payloadBytes);
-
-      // POST /api/v1/audio/listen
-      const listenRes = await fetch('https://hotaudio.net/api/v1/audio/listen', {
-        method: 'POST',
-        headers: {
-          'X-Signature': sig,
-          'X-Key': clientPubHex,
-          'Content-Type': 'application/vnd.hotaudio.crypt+json',
-          'User-Agent': DESKTOP_UA,
-          Origin: 'https://hotaudio.net',
-          Referer: 'https://hotaudio.net/',
-        },
-        body: encBody,
-      });
-
-      if (!listenRes.ok) {
-        throw new Error(`Hotaudio listen API returned ${listenRes.status} for first=${first}`);
-      }
-
-      // Unwrap their reply. They encrypt it with the same secret but
-      // tick the first nonce byte up by one — presumably so a captured
-      // request can't be replayed back at us as a fake response.
-      const respBuf = new Uint8Array(await listenRes.arrayBuffer());
-      const respNonce = new Uint8Array(reqNonce);
-      respNonce[0] = (respNonce[0] + 1) & 0xff;
-
-      const decCipher = chacha20poly1305(Ee, respNonce);
-      const decRespBytes = decCipher.decrypt(respBuf);
-      return JSON.parse(UTF8_DEC.decode(decRespBytes)) as HotaudioListenResponse;
-    }
-
-    let listenData: HotaudioListenResponse;
+    let first: Awaited<ReturnType<typeof listen>>;
     try {
-      listenData = await doListen(-1);
+      first = await listen(-1);
     } catch (err) {
-      console.error(err instanceof Error ? err.message : err);
-      return null;
+      this.logger.error(err instanceof Error ? err.message : String(err));
+      throw err instanceof HotaudioError ? err : new HotaudioError('listen_failed', String(err));
     }
-    if (!listenData.url) {
-      console.error('Hotaudio listen API returned no .hax url');
-      return null;
-    }
+    if (!first.url) throw new HotaudioError('listen_failed', 'Listen API returned no .hax url');
 
-    // 6. Download .hax file
-    const haxRes = await fetch(listenData.url, { headers: { 'User-Agent': DESKTOP_UA } });
-    if (!haxRes.ok) return null;
-    const haxBytes = new Uint8Array(await haxRes.arrayBuffer());
-
-    // 7. Crack the container: figure out where each segment lives, work
-    // out its key, decrypt it. Every segment is independent, so a corrupt
-    // one only costs us that slice, not the whole track.
+    const haxBytes = await this.fetchHax(first.url);
     const hax = parseHax0Header(haxBytes);
-    const keysMap: Record<number, Uint8Array> = {};
-    for (const [k, v] of Object.entries(listenData.keys)) {
-      keysMap[parseInt(k, 10)] = hexToBytes(v);
-    }
+    const ring = new KeyRing(first.keys, hexToBytes);
 
-    const decryptedSlices: Uint8Array[] = [];
-    let totalLength = 0;
-
-    // Memoize intermediate tree-node keys across segments (see
-    // deriveSegmentKey). Must be cleared whenever new branch keys merge,
-    // so cached nodes never outlive the ground truth they derived from.
-    const nodeKeyCache = new Map<number, Uint8Array>();
-
+    const slices: Uint8Array[] = [];
+    let total = 0;
+    let keyFetches = 0;
     for (let i = 0; i < hax.segmentCount; i++) {
       const seg = hax.segments[i];
       const nextOff = i + 1 < hax.segmentCount ? hax.segments[i + 1].offset : hax.fileLength;
-      const slice = haxBytes.subarray(seg.offset, nextOff);
-      let segKey: Uint8Array;
-      try {
-        segKey = await deriveSegmentKey(keysMap, hax.segmentCount, i, nodeKeyCache);
-      } catch (err) {
-        if (!(err instanceof Error) || !err.message.startsWith('Key missing in keys map')) throw err;
-        // The initial handshake only hands out the first tree-branch key(s).
-        // Longer tracks need follow-up handshakes with first:<segmentIndex>
-        // to fetch the branch covering segment i (same tick is reusable).
-        // Merge the new keys in and retry — each fetch covers a contiguous
-        // block, so this runs ~segmentCount/blockSize times, not per segment.
-        console.error(`Fetching keys for segment ${i} (have ${Object.keys(keysMap).length} branches) ...`);
-        const extra = await doListen(i);
-        let merged = 0;
-        for (const [k, v] of Object.entries(extra.keys)) {
-          const n = parseInt(k, 10);
-          if (!keysMap[n]) merged++;
-          keysMap[n] = hexToBytes(v);
-        }
-        if (merged === 0) throw err;
-        nodeKeyCache.clear();
-        segKey = await deriveSegmentKey(keysMap, hax.segmentCount, i, nodeKeyCache);
+      if (nextOff < seg.offset || nextOff > haxBytes.length) {
+        throw new HotaudioError('hax_parse_failed', `Segment ${i} slice out of bounds`);
       }
-      const plain = decryptSegmentSlice(slice, segKey);
-      decryptedSlices.push(plain);
-      totalLength += plain.length;
+      const slice = haxBytes.subarray(seg.offset, nextOff);
+      let key: Uint8Array;
+      try {
+        key = await ring.derive(hax.segmentCount, i);
+      } catch (err) {
+        if (!(err instanceof HotaudioError) || err.code !== 'keys_exhausted') throw err;
+        if (keyFetches >= this.config.maxKeyFetches) {
+          throw new HotaudioError('keys_exhausted', `Still missing keys after ${keyFetches} fetches`);
+        }
+        this.logger.info(`Fetching keys for segment ${i} (have ${ring.size} branches) ...`);
+        const extra = await listen(i);
+        const merged = ring.merge(extra.keys, hexToBytes);
+        keyFetches++;
+        if (merged === 0) throw err;
+        key = await ring.derive(hax.segmentCount, i);
+      }
+      // A corrupt segment must not kill the whole track, but silently
+      // dropping audio is worse: fail loudly so callers notice.
+      const plain = decryptSegmentSlice(slice, key);
+      slices.push(plain);
+      total += plain.length;
+      opts.onProgress?.(i + 1, hax.segmentCount);
     }
 
-    // 8. Glue the decrypted chunks back together, in order, into one
-    // playable fragmented-MP4 file.
-    // Assemble fragmented MP4
-    const assembled = new Uint8Array(totalLength);
-    let offset = 0;
-    for (const slice of decryptedSlices) {
-      assembled.set(slice, offset);
-      offset += slice.length;
+    const assembled = new Uint8Array(total);
+    let off = 0;
+    for (const s of slices) {
+      assembled.set(s, off);
+      off += s.length;
     }
-
+    if (assembled.length === 0) throw new HotaudioError('segment_decrypt_failed', 'Assembled audio is empty');
+    if (!hasFtyp(assembled)) {
+      this.logger.warn('Decrypted audio has no ftyp box — container format may have changed');
+    }
     return {
       data: assembled,
       mimeType: 'audio/mp4',
@@ -201,8 +130,49 @@ export async function downloadHotaudioTrack(pageUrl: string): Promise<HotaudioDo
       trackId: tid,
       durationSeconds: hax.durationMs / 1000,
     };
+  }
+
+  private async fetchHax(url: string): Promise<Uint8Array> {
+    try {
+      return await fetchBytesWithRetry(url, {
+        fetchFn: this.fetchFn,
+        timeoutMs: this.config.timeoutMs,
+        maxRetries: this.config.maxGetRetries,
+        headers: { 'User-Agent': this.config.userAgent },
+      });
+    } catch (err) {
+      if (err instanceof HotaudioError) throw err;
+      throw new HotaudioError('hax_download_failed', `HAX download failed: ${String(err)}`, { cause: err });
+    }
+  }
+}
+
+function hasFtyp(buf: Uint8Array): boolean {
+  // Scan first 64 bytes for the ftyp box tag instead of assuming an offset.
+  const end = Math.min(buf.length, 64);
+  for (let i = 0; i + 4 <= end; i++) {
+    if (buf[i] === 0x66 && buf[i + 1] === 0x74 && buf[i + 2] === 0x79 && buf[i + 3] === 0x70) return true;
+  }
+  return false;
+}
+
+/** Backward-compatible functional wrapper. Returns null on failure (logs the cause). */
+export async function downloadHotaudioTrack(
+  pageUrl: string,
+  opts: DownloadOptions = {},
+): Promise<HotaudioDownload | null> {
+  const dl = new HotaudioDownloader({
+    config: opts.config,
+    fetchFn: opts.fetchFn,
+    logger: opts.logger,
+  });
+  try {
+    return await dl.download(pageUrl, { trackId: opts.trackId, onProgress: opts.onProgress });
   } catch (err) {
-    console.error('Hotaudio download failed:', err);
+    if (opts.logger) opts.logger.error(err instanceof Error ? err.message : String(err));
+    else console.error('Hotaudio download failed:', err instanceof Error ? err.message : err);
     return null;
   }
 }
+
+export { DEFAULT_CONFIG };

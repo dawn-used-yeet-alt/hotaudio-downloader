@@ -11,7 +11,7 @@ import {
   REPO_ROOT,
 } from './common';
 import { decryptHotaudioState } from '../src/crypto';
-import { signHotaudioPayload } from '../src/signer';
+import { signHotaudioPayload } from '../src/signer/signer';
 
 const url = process.argv[2];
 if (!isTrackUrl(url)) {
