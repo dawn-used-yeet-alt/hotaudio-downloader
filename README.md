@@ -80,8 +80,11 @@ It will — run `bun scripts/diagnose.ts <track-url>` for triage, then see
   `retryable` and HTTP `status`. The fragile failure modes (bad signature vs
   expired tick vs network blip) used to look identical; now they don't.
 - **Retry discipline.** Idempotent GETs (track page, `.hax`) get timeout +
-  exponential backoff. The signed listen POST is never retried — hammering a
-  bad signature only gets you rate-limited.
+  exponential backoff. The signed listen POST is never blindly retried —
+  instead there are exactly two capped self-heals: one fresh-state refetch on
+  `session_expired`, one in-memory bundle refresh on `signature_rejected`
+  (only when the page advertises a newer player). Disable with
+  `autoRecovery: false` or CLI `--no-auto-recovery`.
 - **One config object.** URLs, UA, timeouts, retry counts live in
   `src/config.ts` (`resolveConfig`) instead of being scattered as literals.
 - **Injectable fetch + logger.** `HotaudioDownloader` takes `fetchFn` and

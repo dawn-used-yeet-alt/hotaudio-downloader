@@ -14,9 +14,12 @@ export { parseHax0Header } from './hax/container';
 export { KeyRing, decryptSegmentSlice, deriveSegmentKey } from './hax/keys';
 export { signHotaudioPayload, signPayload } from './signer/signer';
 export { PINNED_NOZZLE_VERSION, PINNED_NOZZLE_URL } from './signer/version';
+export { patchNozzleBundle, isPatchedBundle } from './signer/patch';
+export { fetchLiveNozzleBundle, tryAutoRefreshBundle } from './signer/refresh';
+export { getLoadedNozzleVersion } from './signer/sandbox';
 export { doListen } from './listen';
 export { HotaudioDownloader, downloadHotaudioTrack } from './downloader';
-export type { HotaudioDownload, DownloadOptions } from './downloader';
+export type { HotaudioDownload, DownloadOptions, DownloaderDeps } from './downloader';
 export type {
   HotaudioTrack,
   HotaudioState,

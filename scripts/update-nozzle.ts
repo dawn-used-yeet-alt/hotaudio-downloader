@@ -17,6 +17,7 @@ import {
   isTrackUrl,
   REPO_ROOT,
 } from './common';
+import { patchNozzleBundle } from '../src/signer/patch';
 
 function readOption(name: string): string | undefined {
   const at = process.argv.indexOf(name);
@@ -70,30 +71,20 @@ if (bundleFile) {
   }
 }
 
-// Basic checks: it should be code, and it should be the fresh (unedited) copy.
+// Shared patch-point (also used by runtime auto-refresh): exactly one
+// Dt=E( becomes globalThis.__lastDt=Dt=E(. Anything else needs REPAIR.md.
 if (/^\s*<!DOCTYPE/i.test(playerCode)) {
   console.error('That file is a web page, not player code. Something blocked the download.');
   process.exit(1);
 }
-if (playerCode.includes('__lastDt')) {
-  console.error('That file already has our edit in it. Give me the fresh copy from the site.');
+let edited: string;
+try {
+  edited = patchNozzleBundle(playerCode);
+} catch (err) {
+  console.error(err instanceof Error ? err.message : String(err));
+  console.error('The site reshaped their code, so fix it by hand (see REPAIR.md step 3).');
   process.exit(1);
 }
-
-// Our code needs a handle to the site's signing function, which lives in a
-// line shaped like: Dt=E(
-// We add our own copy of that handle: globalThis.__lastDt=Dt=E(
-// There should be exactly one such line. Any other count means the site
-// reshaped their code and someone has to look at it by hand.
-const matches = playerCode.match(/(?<![\w$.])Dt\s*=\s*E\(/g) || [];
-if (matches.length !== 1) {
-  console.error(
-    'Found ' + matches.length + ' places that look like the signing function (expected 1). ' +
-      'The site reshaped their code, so fix it by hand (see REPAIR.md step 3).'
-  );
-  process.exit(1);
-}
-const edited = playerCode.replace(/(?<![\w$.])Dt\s*=\s*E\(/, 'globalThis.__lastDt=Dt=E(');
 
 // Save the edited player into src/signer/nozzle_raw.ts.
 const nozzlePath = path.join(REPO_ROOT, 'src/signer/nozzle_raw.ts');

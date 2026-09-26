@@ -1,12 +1,14 @@
 #!/usr/bin/env bun
-/** CLI: `bun src/cli.ts <track-url> [-o file.m4a] [--track-id ID] [--verbose]`. */
+/** CLI: `bun src/cli.ts <track-url> [-o file.m4a] [--track-id ID] [--verbose] [--no-auto-recovery]`. */
 import { HotaudioDownloader } from './downloader';
 import { HotaudioError } from './errors';
 import { consoleLogger } from './logger';
 import { assertTrackUrl } from './page';
 
 function usage(): never {
-  console.error('Usage: bun src/cli.ts <hotaudio-track-url> [-o output.m4a] [--track-id ID] [--verbose]');
+  console.error(
+    'Usage: bun src/cli.ts <hotaudio-track-url> [-o output.m4a] [--track-id ID] [--verbose] [--no-auto-recovery]',
+  );
   process.exit(2);
 }
 
@@ -28,6 +30,7 @@ const outIdx = args.indexOf('-o');
 const outFlag = outIdx >= 0 ? args[outIdx + 1] : undefined;
 const trackIdx = args.indexOf('--track-id');
 const trackId = trackIdx >= 0 ? args[trackIdx + 1] : undefined;
+const autoRecovery = !args.includes('--no-auto-recovery');
 
 if (!url) usage();
 try {
@@ -43,6 +46,7 @@ const dl = new HotaudioDownloader({ logger });
 try {
   const result = await dl.download(url, {
     trackId,
+    autoRecovery,
     onProgress: verbose ? (d, t) => logger.debug(`segment ${d}/${t}`) : undefined,
   });
   const outPath = outFlag ?? `${sanitize(result.title)} [${result.trackId}].m4a`;

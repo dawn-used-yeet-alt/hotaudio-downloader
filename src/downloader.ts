@@ -1,17 +1,27 @@
 /**
  * Download orchestrator. Each step is a small method so failures map to one
  * error code and tests can drive steps in isolation.
+ *
+ * Self-healing (on by default, `autoRecovery: false` to disable):
+ * - `session_expired` -> refetch the page once for a fresh tick, retry once.
+ * - `signature_rejected` -> if the page advertises a newer player bundle,
+ *   fetch + patch + smoke-test it in memory and retry the listen once.
+ * Both are capped at one attempt each: recovery hides transient rot, never
+ * retry-loops a real rejection (that gets you rate-limited).
  */
 import { HotaudioError } from './errors';
 import { DEFAULT_CONFIG, resolveConfig, type HotaudioConfig } from './config';
 import { silentLogger, type Logger } from './logger';
 import type { FetchFn } from './http';
 import { fetchBytesWithRetry } from './http';
-import { decryptHotaudioState, hexToBytes, performKeyExchange } from './crypto';
-import { extractStateBlob, fetchTrackPageHtml } from './page';
+import { decryptHotaudioState, hexToBytes, performKeyExchange, type SessionKeys } from './crypto';
+import { extractNozzleVersion, extractStateBlob, fetchTrackPageHtml } from './page';
+import type { HotaudioState } from './types';
 import { parseHax0Header } from './hax/container';
 import { KeyRing, decryptSegmentSlice } from './hax/keys';
-import { doListen } from './listen';
+import { doListen, type ListenRequest } from './listen';
+import { signPayload } from './signer/signer';
+import { tryAutoRefreshBundle } from './signer/refresh';
 
 export interface HotaudioDownload {
   data: Uint8Array;
@@ -28,6 +38,15 @@ export interface DownloadOptions {
   /** Preferred track id; defaults to state.order[0]. */
   trackId?: string;
   onProgress?: (done: number, total: number) => void;
+  /** Override config.autoRecovery for one call. */
+  autoRecovery?: boolean;
+}
+
+/** Seams for tests: fake the network, handshake, or refresh. */
+export interface DownloaderDeps {
+  fetchPageFn?: typeof fetchTrackPageHtml;
+  listenFn?: typeof doListen;
+  refreshFn?: typeof tryAutoRefreshBundle;
 }
 
 function pickTrackId(
@@ -45,29 +64,110 @@ function pickTrackId(
   return ordered[0] ?? Object.keys(tracks)[0];
 }
 
+interface AttemptState {
+  html: string;
+  state: HotaudioState;
+  session: SessionKeys;
+  tid: string;
+  trackKey: string;
+  trackTitle: string;
+}
+
 export class HotaudioDownloader {
   readonly config: HotaudioConfig;
   readonly fetchFn: FetchFn;
   readonly logger: Logger;
+  private readonly deps: DownloaderDeps;
 
-  constructor(opts: { config?: Partial<HotaudioConfig>; fetchFn?: FetchFn; logger?: Logger } = {}) {
+  constructor(
+    opts: { config?: Partial<HotaudioConfig>; fetchFn?: FetchFn; logger?: Logger; deps?: DownloaderDeps } = {},
+  ) {
     this.config = resolveConfig(opts.config);
     this.fetchFn = opts.fetchFn ?? fetch;
     this.logger = opts.logger ?? silentLogger();
+    this.deps = opts.deps ?? {};
   }
 
-  async download(pageUrl: string, opts: Omit<DownloadOptions, 'config' | 'fetchFn' | 'logger'> = {}): Promise<HotaudioDownload> {
-    const html = await fetchTrackPageHtml(pageUrl, this.config, this.fetchFn);
+  async download(
+    pageUrl: string,
+    opts: Omit<DownloadOptions, 'config' | 'fetchFn' | 'logger'> = {},
+  ): Promise<HotaudioDownload> {
+    const autoRecovery = opts.autoRecovery ?? this.config.autoRecovery;
+    let attempt: AttemptState = await this.loadState(pageUrl, opts.trackId);
+    let refetched = false;
+    let refreshed = false;
+
+    for (;;) {
+      try {
+        return await this.attempt(attempt, opts);
+      } catch (err) {
+        if (!(err instanceof HotaudioError) || !autoRecovery) throw err;
+        if (err.code === 'session_expired' && !refetched) {
+          refetched = true;
+          this.logger.info('Session expired; refetching page state once ...');
+          attempt = await this.loadState(pageUrl, opts.trackId);
+          continue;
+        }
+        if (err.code === 'signature_rejected' && !refreshed) {
+          refreshed = true;
+          const recovered = await this.tryRefresh(attempt.html, err);
+          if (recovered) continue;
+          throw err;
+        }
+        throw err;
+      }
+    }
+  }
+
+  private async loadState(pageUrl: string, trackId?: string): Promise<AttemptState> {
+    const fetchPage = this.deps.fetchPageFn ?? fetchTrackPageHtml;
+    const html = await fetchPage(pageUrl, this.config, this.fetchFn);
     const state = decryptHotaudioState(extractStateBlob(html));
-    const tid = pickTrackId(state.tracks, state.order, opts.trackId);
+    const tid = pickTrackId(state.tracks, state.order, trackId);
     const track = state.tracks[tid];
     if (!track) throw new HotaudioError('state_invalid', 'Selected track missing from state');
-
     const session = await performKeyExchange(state.key);
-    const listen = (first: number) =>
-      doListen({ tid, pid: state.pid, key: track.key, tick: state.tick, first }, session, this.config, this.fetchFn);
+    return { html, state, session, tid, trackKey: track.key, trackTitle: track.title };
+  }
 
-    let first: Awaited<ReturnType<typeof listen>>;
+  /** One bundle refresh, then retry the same state. False = nothing to try. */
+  private async tryRefresh(html: string, original: HotaudioError): Promise<boolean> {
+    const live = extractNozzleVersion(html);
+    if (!live) {
+      this.logger.warn('Signature rejected but page hides the player version; see REPAIR.md');
+      return false;
+    }
+    const refresh = this.deps.refreshFn ?? tryAutoRefreshBundle;
+    try {
+      const res = await refresh(live, this.config, this.fetchFn, this.logger, (p) => signPayload(p));
+      if (!res.refreshed) {
+        this.logger.warn(`Signature rejected on current bundle v${res.version}; see REPAIR.md`);
+        return false;
+      }
+      return true;
+    } catch (refreshErr) {
+      // Never mask the original rejection with a refresh failure.
+      this.logger.warn(
+        `Bundle refresh failed (${refreshErr instanceof Error ? refreshErr.message : String(refreshErr)}); see REPAIR.md`,
+      );
+      throw original;
+    }
+  }
+
+  private async attempt(att: AttemptState, opts: { trackId?: string; onProgress?: (d: number, t: number) => void }): Promise<HotaudioDownload> {
+    const listenFn = this.deps.listenFn ?? doListen;
+    const listen = (first: number): Promise<Awaited<ReturnType<typeof doListen>>> => {
+      const req: ListenRequest = {
+        tid: att.tid,
+        pid: att.state.pid,
+        key: att.trackKey,
+        tick: att.state.tick,
+        first,
+      };
+      return listenFn(req, att.session, this.config, this.fetchFn);
+    };
+
+    let first: Awaited<ReturnType<typeof doListen>>;
     try {
       first = await listen(-1);
     } catch (err) {
@@ -126,8 +226,8 @@ export class HotaudioDownloader {
     return {
       data: assembled,
       mimeType: 'audio/mp4',
-      title: track.title,
-      trackId: tid,
+      title: att.trackTitle,
+      trackId: att.tid,
       durationSeconds: hax.durationMs / 1000,
     };
   }
@@ -167,7 +267,11 @@ export async function downloadHotaudioTrack(
     logger: opts.logger,
   });
   try {
-    return await dl.download(pageUrl, { trackId: opts.trackId, onProgress: opts.onProgress });
+    return await dl.download(pageUrl, {
+      trackId: opts.trackId,
+      onProgress: opts.onProgress,
+      autoRecovery: opts.autoRecovery,
+    });
   } catch (err) {
     if (opts.logger) opts.logger.error(err instanceof Error ? err.message : String(err));
     else console.error('Hotaudio download failed:', err instanceof Error ? err.message : err);

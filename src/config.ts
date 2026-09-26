@@ -15,6 +15,8 @@ export interface HotaudioConfig {
   retryBaseMs: number;
   /** Cap on follow-up listen calls used to page in segment keys. */
   maxKeyFetches: number;
+  /** Self-healing: one fresh-state retry on expiry + one bundle refresh on 401. */
+  autoRecovery: boolean;
 }
 
 export const DEFAULT_CONFIG: Readonly<HotaudioConfig> = {
@@ -28,6 +30,7 @@ export const DEFAULT_CONFIG: Readonly<HotaudioConfig> = {
   maxGetRetries: 2,
   retryBaseMs: 500,
   maxKeyFetches: 64,
+  autoRecovery: true,
 };
 
 export function resolveConfig(overrides: Partial<HotaudioConfig> = {}): HotaudioConfig {

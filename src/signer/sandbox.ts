@@ -17,7 +17,7 @@
 import { ENV_HASHES } from './env_hashes';
 import { NOZZLE_RAW } from './nozzle_raw';
 import { HotaudioError } from '../errors';
-import { FAB_STACK_COLUMN, FAB_STACK_INNER, PINNED_NOZZLE_URL } from './version';
+import { FAB_STACK_COLUMN, FAB_STACK_INNER, PINNED_NOZZLE_URL, PINNED_NOZZLE_VERSION } from './version';
 
 export type DtFunction = (payload: string) => string;
 
@@ -30,6 +30,8 @@ interface SandboxHandles {
 
 let cached: SandboxHandles | null = null;
 let origToString: typeof Function.prototype.toString | null = null;
+/** Version of the bundle currently loaded in the sandbox (pinned default). */
+let loadedVersion: string = PINNED_NOZZLE_VERSION;
 
 function nativeStub(name: string, store: Map<unknown, string>): () => void {
   const f = function () {};
@@ -38,7 +40,7 @@ function nativeStub(name: string, store: Map<unknown, string>): () => void {
   return f as () => void;
 }
 
-function buildSandbox(): SandboxHandles {
+function buildSandbox(bundleRaw: string = NOZZLE_RAW): SandboxHandles {
   const g = globalThis as Record<string, unknown> & { [k: symbol]: unknown };
   const stubs = new Map<unknown, string>();
   let frozenSec: number | null = null;
@@ -166,7 +168,7 @@ function buildSandbox(): SandboxHandles {
   g.__ENVHASHES = ENV_HASHES;
 
   // biome-ignore lint: raw vendor bytes must be eval'd as-is (see header).
-  (0, eval)(NOZZLE_RAW);
+  (0, eval)(bundleRaw);
 
   const dt = g[STATE_KEY] as unknown;
   if (typeof dt !== 'function') {
@@ -187,4 +189,32 @@ export function getSandbox(): SandboxHandles {
 /** Test-only: drop the cached theater so tests start from a clean eval. */
 export function __resetSandboxForTests(): void {
   cached = null;
+  loadedVersion = PINNED_NOZZLE_VERSION;
+}
+
+/** Which bundle version the sandbox is currently running. */
+export function getLoadedNozzleVersion(): string {
+  return loadedVersion;
+}
+
+/**
+ * Swap the live bundle bytes into the sandbox (runtime auto-refresh).
+ * The bundle must already be patched via `patchNozzleBundle`. On failure the
+ * previous theater is restored so a bad refresh never poisons signing.
+ */
+export function refreshSandboxBundle(patchedBundle: string, version: string): void {
+  const prev = cached;
+  const prevVersion = loadedVersion;
+  cached = null;
+  try {
+    cached = buildSandbox(patchedBundle);
+    loadedVersion = version;
+  } catch (err) {
+    cached = prev;
+    loadedVersion = prevVersion;
+    if (err instanceof HotaudioError) throw err;
+    throw new HotaudioError('signer_init_failed', `Refreshed bundle ${version} failed to init`, {
+      cause: err,
+    });
+  }
 }
